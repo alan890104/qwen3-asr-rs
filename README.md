@@ -14,6 +14,72 @@ Pure-Rust inference engine for **Qwen3-ASR** automatic speech recognition models
 - **MRoPE** — full multi-dimensional rotary position embedding for the Qwen3 decoder
 - **No runtime dependencies** — statically linked, single binary
 
+## Demo
+
+Five audio samples are included in [`audio/`](audio/) — two short and three long — covering English, Mandarin, and code-switched speech. Click the links below to play each file directly in your browser (GitHub renders WAV files inline).
+
+### Short Samples — exact match
+
+#### sample1.wav · English · 3 s
+
+[▶ audio/sample1.wav](audio/sample1.wav)
+
+| | Text |
+|---|---|
+| **Expected** | The quick brown fox jumps over the lazy dog. |
+| **Rust output** | The quick brown fox jumps over the lazy dog. |
+
+---
+
+#### sample2.wav · English · 4 s
+
+[▶ audio/sample2.wav](audio/sample2.wav)
+
+| | Text |
+|---|---|
+| **Expected** | Speech recognition has improved a lot in recent years. |
+| **Rust output** | Speech recognition has improved a lot in recent years. |
+
+---
+
+### Long Samples
+
+#### sample4.wav · English paragraph · 36 s
+
+[▶ audio/sample4.wav](audio/sample4.wav)
+
+**Expected:**
+> Artificial intelligence has rapidly transformed numerous industries over the past decade. From healthcare diagnostics to autonomous vehicles, machine learning models are now capable of performing tasks that once required years of human expertise. Natural language processing, in particular, has seen dramatic improvements, enabling computers to understand, generate, and translate human speech with remarkable accuracy. Researchers continue to push the boundaries of what is possible, developing systems that can reason, plan, and even demonstrate creativity.
+
+**Rust output (0.6B):**
+> Artificial intelligence has rapidly transformed numerous industries over the past decade. From healthcare diagnostics to autonomous vehicles, machine learning models are now capable of performing tasks that once required years of human expertise. Natural language processing, in particular, has seen dramatic improvements, enabling computers to understand, generate, and translate human speech with remarkable accuracy. Researchers continue to push the boundaries of what is possible, developing systems that can reason, plan, and even demonstrate creativity.
+
+---
+
+#### sample5.wav · Mandarin paragraph · 30 s
+
+[▶ audio/sample5.wav](audio/sample5.wav)
+
+**Expected:**
+> 随着科技的不断进步，人工智能已经深入到我们日常生活的每个角落。在医疗领域，智能诊断系统能够通过分析医学影像，快速准确地识别疾病。在交通领域，自动驾驶技术正在逐步走向成熟。在教育领域，个性化学习系统能够根据每个学生的学习进度，提供量身定制的教学内容，让每个孩子都能得到最适合自己的教育。
+
+**Rust output (0.6B):**
+> 随着科技的不断进步，人工智能已经深入到我们日常生活的每个角落。在医疗领域，智能诊断系统能够通过分析医学影像，快速准确地识别疾病。在交通领域，自动驾驶技术正在逐步走向成熟。在教育领域，个性化学习系统能够根据每个学生的学习进度，提供量身定制的教学内容，让每个孩子都能得到最适合自己的教育。
+
+---
+
+#### sample6.wav · Code-switched (Chinese + English) · 29 s
+
+[▶ audio/sample6.wav](audio/sample6.wav)
+
+**Expected:**
+> 今天我们来讨论一下大语言模型的发展现状。Large language models like GPT and Claude have shown impressive results on a wide range of benchmarks, demonstrating strong reasoning and language understanding capabilities. 未来，随着多模态技术的进步，这些模型将能够同时处理文字、图像和语音，实现更加自然和智能的人机交互。
+
+**Rust output (0.6B):**
+> 今天我们来讨论一下大语言模型的发展现状。Large language models like GPT and Claude have shown impressive results on a wide range of benchmarks demonstrating strong reasoning and language understanding capabilities. 未来，随着多模态技术的进步，这些模型将能够同时处理文字、图像和语音，实现更加自然和智能的人机交互。
+
+---
+
 ## Architecture
 
 Qwen3-ASR combines a Whisper-style audio encoder with a Qwen3 causal language model decoder:
