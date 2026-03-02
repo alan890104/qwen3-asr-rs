@@ -175,14 +175,22 @@ impl MelExtractor {
         let n_frames = if n_frames_with_last > 0 { n_frames_with_last - 1 } else { 0 };
 
         // Apply mel filterbank: [num_mel_bins × n_freqs] × [n_freqs × n_frames]
+        //
+        // Loop order m → f → t makes the innermost access `power_row[t]` contiguous
+        // in memory (stride 1), enabling auto-vectorisation.  The original t → f order
+        // had `power[f * n_frames_with_last + t]` with stride n_frames_with_last.
+        // Accumulation order over f is identical in both forms → bit-identical output.
         let mut mel_spec = vec![0.0f32; self.num_mel_bins * n_frames];
         for m in 0..self.num_mel_bins {
-            for t in 0..n_frames {
-                let mut sum = 0.0f32;
-                for f in 0..self.n_freqs {
-                    sum += self.mel_filters[m * self.n_freqs + f] * power[f * n_frames_with_last + t];
+            let filter_row = &self.mel_filters[m * self.n_freqs..(m + 1) * self.n_freqs];
+            let out_row    = &mut mel_spec[m * n_frames..(m + 1) * n_frames];
+            for f in 0..self.n_freqs {
+                let w = filter_row[f];
+                if w == 0.0 { continue; } // filterbank is sparse; skip zero weights
+                let power_row = &power[f * n_frames_with_last..f * n_frames_with_last + n_frames];
+                for (t, &p) in power_row.iter().enumerate() {
+                    out_row[t] += w * p;
                 }
-                mel_spec[m * n_frames + t] = sum;
             }
         }
 
@@ -215,12 +223,21 @@ pub fn load_audio_wav(path: &str, target_sr: u32) -> Result<Vec<f32>> {
 
     let samples_f32: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => {
-            reader.into_samples::<f32>().map(|s| s.unwrap()).collect()
+            reader
+                .into_samples::<f32>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?
         }
         hound::SampleFormat::Int => {
             let bits = spec.bits_per_sample;
             let max_val = (1i64 << (bits - 1)) as f32;
-            reader.into_samples::<i32>().map(|s| s.unwrap() as f32 / max_val).collect()
+            reader
+                .into_samples::<i32>()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?
+                .into_iter()
+                .map(|s| s as f32 / max_val)
+                .collect()
         }
     };
 

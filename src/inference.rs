@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::config::AsrConfig;
 use crate::decoder::{compute_mrope_cos_sin, create_causal_mask, KvCache, TextDecoder};
 use crate::encoder::AudioEncoder;
+use crate::gguf_loader::{load_gguf_config, load_gguf_weights};
 use crate::mel::{load_audio_wav, MelExtractor};
 
 // Special token IDs
@@ -16,6 +17,19 @@ const AUDIO_PAD_TOKEN_ID: i64 = 151676;
 const ASR_TEXT_SEP_TOKEN_ID: u32 = 151704;
 
 const MEL_SAMPLE_RATE: u32 = 16000;
+const N_FFT:           usize = 400; // Whisper-compatible FFT window (25ms @ 16kHz)
+const HOP_LENGTH:      usize = 160; // Whisper-compatible hop size  (10ms @ 16kHz)
+const MAX_NEW_TOKENS:  usize = 512;
+
+// Prompt structure token IDs (Qwen3 chat template)
+const TOK_IM_START:    i64 = 151644; // <|im_start|>
+const TOK_SYSTEM:      i64 = 8948;   // "system"
+const TOK_NEWLINE:     i64 = 198;    // "\n"
+const TOK_IM_END:      i64 = IM_END_TOKEN_ID; // 151645
+const TOK_USER:        i64 = 872;    // "user"
+const TOK_AUDIO_START: i64 = 151669; // <|audio_start|>
+const TOK_AUDIO_END:   i64 = 151670; // <|audio_end|>
+const TOK_ASSISTANT:   i64 = 77091;  // "assistant"
 
 pub struct TranscribeResult {
     pub text: String,
@@ -37,6 +51,15 @@ pub struct AsrInference {
 // caller), so crossing the thread boundary is safe.
 unsafe impl Send for AsrInference {}
 
+/// RAII guard: deletes a temporary file on drop (all exit paths, including panics).
+struct TempFileGuard<'a>(&'a std::path::Path);
+
+impl Drop for TempFileGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 impl AsrInference {
     pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
         eprintln!("Loading config...");
@@ -47,6 +70,45 @@ impl AsrInference {
         let weights = load_weights(model_dir, &device).context("load weights")?;
         eprintln!("Loaded {} weight tensors", weights.len());
 
+        eprintln!("Loading tokenizer...");
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("tokenizer load failed: {}", e))?;
+
+        eprintln!("Model loaded successfully.");
+        Self::build_engine(config, weights, tokenizer, device)
+    }
+
+    /// Load model weights from a GGUF file (Q8_0 quantized).
+    /// The embedded tokenizer and config are read directly from the GGUF metadata.
+    pub fn load_gguf(gguf_path: &Path, device: Device) -> Result<Self> {
+        eprintln!("Reading GGUF config + tokenizer...");
+        let (config, tokenizer_json) =
+            load_gguf_config(gguf_path).context("load GGUF config")?;
+
+        // Write tokenizer JSON to a temp file so the HuggingFace tokenizer can load it.
+        let tmp_dir = std::env::temp_dir();
+        let tok_path = tmp_dir.join(format!("qwen3_asr_tok_{}.json", std::process::id()));
+        std::fs::write(&tok_path, &tokenizer_json).context("write temp tokenizer")?;
+        let _tok_guard = TempFileGuard(&tok_path); // deleted on drop (all exit paths)
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("tokenizer load failed: {}", e))?;
+
+        eprintln!("Loading GGUF weights (dequantizing)...");
+        let weights = load_gguf_weights(gguf_path, &device).context("load GGUF weights")?;
+        eprintln!("Loaded {} weight tensors", weights.len());
+
+        eprintln!("GGUF model loaded successfully.");
+        Self::build_engine(config, weights, tokenizer, device)
+    }
+
+    /// Shared engine assembly: loads encoder/decoder from any weight source.
+    fn build_engine(
+        config: AsrConfig,
+        weights: HashMap<String, Tensor>,
+        tokenizer: tokenizers::Tokenizer,
+        device: Device,
+    ) -> Result<Self> {
         eprintln!("Loading audio encoder...");
         let audio_encoder = AudioEncoder::load(
             &weights,
@@ -64,18 +126,13 @@ impl AsrInference {
         )
         .context("load text decoder")?;
 
-        eprintln!("Loading tokenizer...");
-        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("tokenizer load failed: {}", e))?;
-
         let mel_extractor = MelExtractor::new(
-            400,
-            160,
+            N_FFT,
+            HOP_LENGTH,
             config.thinker_config.audio_config.num_mel_bins,
             MEL_SAMPLE_RATE,
         );
 
-        eprintln!("Model loaded successfully.");
         Ok(Self { audio_encoder, text_decoder, mel_extractor, tokenizer, config, device })
     }
 
@@ -129,20 +186,25 @@ impl AsrInference {
             Tensor::cat(&[&before_emb, &audio_emb, &after_emb], 0)?.unsqueeze(0)?;
         // hidden_states: [1, seq_len, hidden]
 
-        // Step 5: MRoPE position IDs (all 3 sections use the same linear positions)
-        let positions: Vec<i64> = (0..seq_len as i64).collect();
-        let position_ids: [Vec<i64>; 3] =
-            [positions.clone(), positions.clone(), positions.clone()];
-
-        let text_cfg = self.config.thinker_config.text_config.clone();
-        let (cos, sin) = compute_mrope_cos_sin(
-            &position_ids,
+        // Step 5: Precompute the full MRoPE cos/sin table for prefill + all generation steps.
+        // Calling compute_mrope_cos_sin once avoids 512 redundant trig computations.
+        let text_cfg = &self.config.thinker_config.text_config;
+        let total_positions = seq_len + MAX_NEW_TOKENS;
+        let all_pos: Vec<i64> = (0..total_positions as i64).collect();
+        let full_ids: [Vec<i64>; 3] = [all_pos.clone(), all_pos.clone(), all_pos.clone()];
+        let (cos_table, sin_table) = compute_mrope_cos_sin(
+            &full_ids,
             text_cfg.head_dim,
             text_cfg.rope_theta,
             &text_cfg.mrope_section(),
             text_cfg.mrope_interleaved(),
             &self.device,
         )?;
+        // cos_table / sin_table shape: [total_positions, head_dim]
+
+        // Prefill: take the first seq_len rows.
+        let cos = cos_table.narrow(0, 0, seq_len)?;
+        let sin = sin_table.narrow(0, 0, seq_len)?;
 
         // Step 6: Prefill
         let mask = create_causal_mask(seq_len, 0, &self.device)?;
@@ -158,7 +220,6 @@ impl AsrInference {
 
         // Step 7: Autoregressive generation
         let mut generated_ids: Vec<u32> = Vec::new();
-        let max_new_tokens = 512;
         let eos_ids: &[i64] = &[ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID];
 
         // logits: [1, seq_len, vocab]
@@ -169,7 +230,7 @@ impl AsrInference {
         let debug_sample = std::env::var("DEBUG_LOGITS").is_ok();
         let mut step_idx = 0usize;
 
-        for _ in 0..max_new_tokens {
+        for _ in 0..MAX_NEW_TOKENS {
             let next_token = next_logits.argmax(1)?.to_vec1::<u32>()?[0];
 
             // Debug: print top-10 logits at each step
@@ -201,20 +262,9 @@ impl AsrInference {
                 Tensor::from_vec(vec![next_token], (1,), &self.device)?;
             let next_emb = self.text_decoder.embed(&next_id_t)?.unsqueeze(0)?; // [1, 1, hidden]
 
-            // MRoPE for single new token
-            let new_pos: [Vec<i64>; 3] = [
-                vec![current_pos as i64],
-                vec![current_pos as i64],
-                vec![current_pos as i64],
-            ];
-            let (new_cos, new_sin) = compute_mrope_cos_sin(
-                &new_pos,
-                text_cfg.head_dim,
-                text_cfg.rope_theta,
-                &text_cfg.mrope_section(),
-                text_cfg.mrope_interleaved(),
-                &self.device,
-            )?;
+            // MRoPE for single new token: index into the precomputed table (O(1)).
+            let new_cos = cos_table.narrow(0, current_pos, 1)?; // [1, head_dim]
+            let new_sin = sin_table.narrow(0, current_pos, 1)?;
 
             let past_len = kv_cache.seq_len();
             let step_mask = create_causal_mask(1, past_len, &self.device)?;
@@ -264,15 +314,15 @@ impl AsrInference {
         language: Option<&str>,
     ) -> Result<(Vec<i64>, usize)> {
         let mut tokens: Vec<i64> = vec![
-            151644, // <|im_start|>
-            8948,   // system
-            198,    // \n
-            151645, // <|im_end|>
-            198,    // \n
-            151644, // <|im_start|>
-            872,    // user
-            198,    // \n
-            151669, // <|audio_start|>
+            TOK_IM_START,
+            TOK_SYSTEM,
+            TOK_NEWLINE,
+            TOK_IM_END,
+            TOK_NEWLINE,
+            TOK_IM_START,
+            TOK_USER,
+            TOK_NEWLINE,
+            TOK_AUDIO_START,
         ];
 
         let audio_start_pos = tokens.len();
@@ -281,15 +331,15 @@ impl AsrInference {
         }
 
         tokens.extend_from_slice(&[
-            151670, // <|audio_end|>
-            151645, // <|im_end|>
-            198,    // \n
-            151644, // <|im_start|>
+            TOK_AUDIO_END,
+            TOK_IM_END,
+            TOK_NEWLINE,
+            TOK_IM_START,
         ]);
 
         if let Some(lang) = language {
-            tokens.push(77091); // assistant
-            tokens.push(198);
+            tokens.push(TOK_ASSISTANT);
+            tokens.push(TOK_NEWLINE);
             let prefix = format!("language {}", capitalize_first(lang));
             let enc = self
                 .tokenizer
@@ -297,8 +347,8 @@ impl AsrInference {
                 .map_err(|e| anyhow::anyhow!("encode: {}", e))?;
             tokens.extend(enc.get_ids().iter().map(|&id| id as i64));
         } else {
-            tokens.push(77091); // assistant
-            tokens.push(198);
+            tokens.push(TOK_ASSISTANT);
+            tokens.push(TOK_NEWLINE);
         }
 
         Ok((tokens, audio_start_pos))

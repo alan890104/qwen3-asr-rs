@@ -2,20 +2,34 @@ use qwen3_asr::inference;
 
 use anyhow::Result;
 use candle_core::Device;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> Result<()> {
-    // Allow overriding the model directory via CLI arg or env var.
-    // Usage: cargo run --release -- models_1.7b
-    let model_dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("MODEL_DIR").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("models"));
+    // CLI argument parsing (no external crate).
+    //
+    // Usage (safetensors):  cargo run --release -- [model_dir]
+    // Usage (GGUF):         cargo run --release -- --gguf <path.gguf>
+    let args: Vec<String> = std::env::args().collect();
+    let mut gguf_path: Option<PathBuf> = None;
+    let mut model_dir_arg: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--gguf" {
+            if i + 1 >= args.len() {
+                eprintln!("ERROR: --gguf requires a path argument");
+                std::process::exit(1);
+            }
+            gguf_path = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else if !args[i].starts_with('-') {
+            model_dir_arg = Some(args[i].clone());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
 
     let audio_dir = PathBuf::from("audio");
-
-    eprintln!("Model dir: {}", model_dir.display());
 
     let device = Device::new_metal(0).unwrap_or_else(|_| {
         eprintln!("Metal not available, using CPU");
@@ -23,7 +37,17 @@ fn main() -> Result<()> {
     });
     eprintln!("Device: {:?}", device);
 
-    let engine = inference::AsrInference::load(&model_dir, device)?;
+    let engine = if let Some(ref gp) = gguf_path {
+        eprintln!("GGUF path: {}", gp.display());
+        inference::AsrInference::load_gguf(Path::new(gp), device)?
+    } else {
+        let model_dir = model_dir_arg
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("MODEL_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("models"));
+        eprintln!("Model dir: {}", model_dir.display());
+        inference::AsrInference::load(&model_dir, device)?
+    };
 
     // Short samples: expected text is loaded from the paired .txt file.
     // These are used for exact-match regression testing.
@@ -50,7 +74,9 @@ fn main() -> Result<()> {
         eprintln!("\n{}", "=".repeat(60));
         eprintln!("Testing: {}", wav_file);
 
-        match engine.transcribe(audio_path.to_str().unwrap(), None) {
+        let path_str = audio_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path: {}", audio_path.display()))?;
+        match engine.transcribe(path_str, None) {
             Ok(result) => {
                 let got = result.text.trim();
                 let matched = got == expected;
@@ -90,7 +116,9 @@ fn main() -> Result<()> {
         eprintln!("\n{}", "=".repeat(60));
         eprintln!("Transcribing: {}", wav_file);
 
-        match engine.transcribe(audio_path.to_str().unwrap(), None) {
+        let path_str = audio_path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path: {}", audio_path.display()))?;
+        match engine.transcribe(path_str, None) {
             Ok(result) => {
                 println!("File     : {}", wav_file);
                 if let Some(ref r) = reference {

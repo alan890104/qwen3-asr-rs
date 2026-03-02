@@ -159,13 +159,12 @@ fn build_interleaved_dim_map(sections: &[usize], total: usize) -> Vec<usize> {
     map
 }
 
+/// Apply rotary embeddings.
+/// `cos` and `sin` must already be cast to `x.dtype()` and shaped [1, 1, seq, head_dim].
+/// The cast and unsqueeze are done once upstream in `TextDecoder::forward`.
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    // Cast cos/sin to match x's dtype (cos/sin are F32, x may be BF16).
-    let dtype = x.dtype();
-    let cos = cos.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, seq, head_dim]
-    let sin = sin.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
     let x_rotated = rotate_half(x)?;
-    (x.broadcast_mul(&cos)? + x_rotated.broadcast_mul(&sin)?).map_err(Into::into)
+    (x.broadcast_mul(cos)? + x_rotated.broadcast_mul(sin)?).map_err(Into::into)
 }
 
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
@@ -177,9 +176,9 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&neg_x2, &x1], x.rank() - 1).map_err(Into::into)
 }
 
-fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
+fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
-        return Ok(x.clone());
+        return Ok(x); // consume ownership: no clone needed
     }
     let (bsz, num_kv, seq, hd) = x.dims4()?;
     x.unsqueeze(2)?
@@ -285,12 +284,12 @@ impl TextAttention {
             (k, v)
         };
 
-        let new_cache = (k.clone(), v.clone());
-
-        // Repeat KV heads
+        // Save pre-expand K/V as the cache entry, then consume originals for repeat_kv.
+        // This avoids a second clone inside repeat_kv when n_rep == 1.
         let n_rep = nqh / nkvh;
-        let k = repeat_kv(&k, n_rep)?;
-        let v = repeat_kv(&v, n_rep)?;
+        let new_cache = (k.clone(), v.clone());
+        let k = repeat_kv(k, n_rep)?;
+        let v = repeat_kv(v, n_rep)?;
 
         // Attention
         let scale = (hd as f64).sqrt();
@@ -470,16 +469,22 @@ impl TextDecoder {
     pub fn forward(
         &self,
         hidden_states: &Tensor, // [1, seq, hidden]
-        cos: &Tensor,
-        sin: &Tensor,
+        cos: &Tensor,           // [seq, head_dim], F32
+        sin: &Tensor,           // [seq, head_dim], F32
         kv_cache: &mut KvCache,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let mut hidden = hidden_states.clone();
 
+        // Cast cos/sin to compute dtype and unsqueeze to [1, 1, seq, head_dim] once,
+        // rather than repeating the cast inside apply_rotary_emb for every layer.
+        let compute_dtype = hidden.dtype();
+        let cos4d = cos.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+        let sin4d = sin.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+
         for (i, layer) in self.layers.iter().enumerate() {
             let cache = kv_cache.get(i);
-            let (h, new_cache) = layer.forward(&hidden, cos, sin, cache, mask)?;
+            let (h, new_cache) = layer.forward(&hidden, &cos4d, &sin4d, cache, mask)?;
             kv_cache.set(i, new_cache);
             hidden = h;
         }
