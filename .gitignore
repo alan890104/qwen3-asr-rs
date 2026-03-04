@@ -15,3 +15,12 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# GGUF model files
+*.gguf
+
+# Benchmark shell script
+bench.sh
+
+# Internal compatibility test crate
+compat_test/

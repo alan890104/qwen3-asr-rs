@@ -1,3 +1,5 @@
+#![allow(dead_code)] // config fields are part of the model schema; not all are used in inference
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,8 +79,6 @@ pub struct TextDecoderConfig {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
     pub rope_scaling: Option<RopeScaling>,
-    #[serde(default = "default_tie_word_embeddings")]
-    pub tie_word_embeddings: bool,
 }
 
 fn default_vocab_size() -> usize { 151936 }
@@ -90,7 +90,6 @@ fn default_num_key_value_heads() -> usize { 8 }
 fn default_head_dim() -> usize { 128 }
 fn default_rms_norm_eps() -> f64 { 1e-6 }
 fn default_rope_theta() -> f64 { 1_000_000.0 }
-fn default_tie_word_embeddings() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
@@ -127,5 +126,85 @@ impl TextDecoderConfig {
             .as_ref()
             .map(|rs| rs.mrope_interleaved || rs.interleaved)
             .unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_base_config() -> TextDecoderConfig {
+        TextDecoderConfig {
+            vocab_size: 151936,
+            hidden_size: 1024,
+            intermediate_size: 3072,
+            num_hidden_layers: 28,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            rope_scaling: None,
+        }
+    }
+
+    #[test]
+    fn test_mrope_section_default_when_no_rope_scaling() {
+        let cfg = make_base_config();
+        assert_eq!(cfg.mrope_section(), vec![24, 20, 20]);
+    }
+
+    #[test]
+    fn test_mrope_section_custom() {
+        let mut cfg = make_base_config();
+        cfg.rope_scaling = Some(RopeScaling {
+            rope_type: "mrope".to_string(),
+            mrope_section: vec![4, 4, 8],
+            interleaved: false,
+            mrope_interleaved: false,
+        });
+        assert_eq!(cfg.mrope_section(), vec![4, 4, 8]);
+    }
+
+    #[test]
+    fn test_mrope_interleaved_default_true_when_no_rope_scaling() {
+        let cfg = make_base_config();
+        assert!(cfg.mrope_interleaved(), "should default to true when rope_scaling is None");
+    }
+
+    #[test]
+    fn test_mrope_interleaved_via_mrope_interleaved_flag() {
+        let mut cfg = make_base_config();
+        cfg.rope_scaling = Some(RopeScaling {
+            rope_type: "mrope".to_string(),
+            mrope_section: vec![24, 20, 20],
+            interleaved: false,
+            mrope_interleaved: true,
+        });
+        assert!(cfg.mrope_interleaved());
+    }
+
+    #[test]
+    fn test_mrope_interleaved_via_interleaved_flag() {
+        let mut cfg = make_base_config();
+        cfg.rope_scaling = Some(RopeScaling {
+            rope_type: "mrope".to_string(),
+            mrope_section: vec![24, 20, 20],
+            interleaved: true,
+            mrope_interleaved: false,
+        });
+        assert!(cfg.mrope_interleaved());
+    }
+
+    #[test]
+    fn test_mrope_interleaved_both_false() {
+        let mut cfg = make_base_config();
+        cfg.rope_scaling = Some(RopeScaling {
+            rope_type: "mrope".to_string(),
+            mrope_section: vec![24, 20, 20],
+            interleaved: false,
+            mrope_interleaved: false,
+        });
+        assert!(!cfg.mrope_interleaved());
     }
 }

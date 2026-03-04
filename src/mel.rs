@@ -21,7 +21,7 @@ fn reflection_pad(signal: &[f32], pad: usize) -> Vec<f32> {
     }
     padded.extend_from_slice(signal);
     // Right padding: reflect from n-pad-1..n-1 in reverse
-    let right_start = if n >= pad + 1 { n - pad - 1 } else { 0 };
+    let right_start = if n > pad { n - pad - 1 } else { 0 };
     for i in (right_start..n - 1).rev() {
         padded.push(signal[i]);
     }
@@ -136,7 +136,7 @@ fn create_mel_filterbank(
     filters
 }
 
-pub struct MelExtractor {
+pub(crate) struct MelExtractor {
     n_fft: usize,
     hop_length: usize,
     num_mel_bins: usize,
@@ -145,19 +145,18 @@ pub struct MelExtractor {
 }
 
 impl MelExtractor {
-    pub fn new(n_fft: usize, hop_length: usize, num_mel_bins: usize, sample_rate: u32) -> Self {
+    pub(crate) fn new(n_fft: usize, hop_length: usize, num_mel_bins: usize, sample_rate: u32) -> Self {
         let n_freqs = n_fft / 2 + 1;
         let mel_filters =
             create_mel_filterbank(num_mel_bins, n_fft, sample_rate, 0.0, sample_rate as f64 / 2.0);
-        Self { n_fft, hop_length, num_mel_bins, mel_filters, n_freqs: n_freqs }
+        Self { n_fft, hop_length, num_mel_bins, mel_filters, n_freqs }
     }
 
     /// Extract log-mel spectrogram.
     /// Returns flat vec [num_mel_bins × num_frames], and (num_mel_bins, num_frames).
-    pub fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
+    pub(crate) fn extract(&self, samples: &[f32]) -> Result<(Vec<f32>, usize, usize)> {
         // Pad to next multiple of hop_length
-        let padded_len =
-            ((samples.len() + self.hop_length - 1) / self.hop_length) * self.hop_length;
+        let padded_len = samples.len().div_ceil(self.hop_length) * self.hop_length;
         let mut padded_samples = samples.to_vec();
         padded_samples.resize(padded_len, 0.0);
 
@@ -198,7 +197,7 @@ impl MelExtractor {
         let log10_factor = 1.0 / 10.0f32.ln();
         let mut max_val = f32::NEG_INFINITY;
         for v in mel_spec.iter_mut() {
-            *v = (v.max(1e-10f32).ln() * log10_factor);
+            *v = v.max(1e-10f32).ln() * log10_factor;
             if *v > max_val {
                 max_val = *v;
             }
@@ -214,8 +213,57 @@ impl MelExtractor {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hann_window_edges() {
+        let w = hann_window(5);
+        assert_eq!(w.len(), 5);
+        assert!(w[0].abs() < 1e-6, "window[0] should be 0");
+        assert!(w[4].abs() < 1e-6, "window[n-1] should be ~0");
+        // Center: x = 2π*2/4 = π → cos(π) = -1 → 0.5*(1-(-1)) = 1.0
+        assert!((w[2] - 1.0).abs() < 1e-6, "window[center] should be 1");
+    }
+
+    #[test]
+    fn test_reflection_pad_basic() {
+        let signal = vec![1.0f32, 2.0, 3.0];
+        let padded = reflection_pad(&signal, 1);
+        assert_eq!(padded, vec![2.0f32, 1.0, 2.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_mel_filterbank_shape_and_nonneg() {
+        let num_mels = 128;
+        let n_fft = 400;
+        let sr = 16000u32;
+        let n_freqs = n_fft / 2 + 1; // 201
+        let filters = create_mel_filterbank(num_mels, n_fft, sr, 0.0, sr as f64 / 2.0);
+        assert_eq!(filters.len(), num_mels * n_freqs);
+        assert!(filters.iter().all(|&v| v >= 0.0), "all filterbank values must be >= 0");
+    }
+
+    #[test]
+    fn test_mel_extractor_silent_signal() {
+        // 1 second of silence at 16 kHz
+        let samples = vec![0.0f32; 16000];
+        let extractor = MelExtractor::new(400, 160, 128, 16000);
+        let (mel, n_mels, n_frames) = extractor.extract(&samples).unwrap();
+        assert_eq!(n_mels, 128);
+        assert!(n_frames > 0, "n_frames should be positive");
+        assert_eq!(mel.len(), n_mels * n_frames);
+        assert!(mel.iter().all(|v| v.is_finite()), "all mel values must be finite");
+    }
+}
+
 /// Load audio from WAV file, convert to 16kHz mono f32 samples.
-pub fn load_audio_wav(path: &str, target_sr: u32) -> Result<Vec<f32>> {
+pub fn load_audio_wav(path: &str, target_sr: u32) -> crate::Result<Vec<f32>> {
+    load_audio_wav_impl(path, target_sr).map_err(crate::error::AsrError::AudioDecode)
+}
+
+fn load_audio_wav_impl(path: &str, target_sr: u32) -> anyhow::Result<Vec<f32>> {
     let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let sr = spec.sample_rate;

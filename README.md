@@ -10,7 +10,6 @@ Pure-Rust inference engine for **Qwen3-ASR** automatic speech recognition models
 - **Multilingual** — English, Chinese, and code-switched audio (mixed-language)
 - **Sharded weights** — loads both single-file and multi-shard `safetensors` models
 - **Accurate mel extraction** — matches the official `WhisperFeatureExtractor` (Slaney-normalized, 128 mel bins)
-- **BF16 throughout** — matches the reference PyTorch BF16 output exactly
 - **MRoPE** — full multi-dimensional rotary position embedding for the Qwen3 decoder
 - **No runtime dependencies** — statically linked, single binary
 
@@ -94,15 +93,42 @@ Audio → Mel spectrogram (128 bins) → Conv2d ×3 downsampler
 
 ## Quick Start
 
+### 0. Use directly from HuggingFace Hub
+
+With the `hub` feature, no manual download is needed:
+
+```rust
+use qwen3_asr::{AsrInference, TranscribeOptions};
+use candle_core::Device;
+use std::path::Path;
+
+let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+let engine = AsrInference::from_pretrained(
+    "Qwen/Qwen3-ASR-0.6B",
+    Path::new("models/"),
+    device,
+)?;
+let result = engine.transcribe("audio.wav", TranscribeOptions::default())?;
+println!("{}", result.text);
+```
+
+Or run the bundled example:
+
+```bash
+cargo run --example transcribe --features hub --release -- audio/sample1.wav
+```
+
+Models are cached in the `cache_dir` you specify (e.g. `models/`). A `.complete` marker file inside the model subdirectory indicates a successful download; subsequent calls skip the download entirely.
+
 ### 1. Download a model
 
 ```bash
 pip install huggingface_hub
 
-# 0.6B (~3.4 GB)
+# 0.6B (~1.7 GB safetensors)
 huggingface-cli download Qwen/Qwen3-ASR-0.6B --local-dir models
 
-# 1.7B (~4.5 GB)
+# 1.7B (~4.5 GB safetensors)
 huggingface-cli download Qwen/Qwen3-ASR-1.7B --local-dir models_1.7b
 ```
 
@@ -122,25 +148,63 @@ cargo run --release --no-default-features
 ### 3. Transcribe your own audio
 
 ```bash
-MODEL_DIR=models cargo run --release -- path/to/audio.wav
+MODEL_DIR=models cargo run --release
 ```
 
-> Audio is automatically resampled to 16 kHz mono. WAV, and any format supported by `hound` are accepted.
+> Audio is automatically resampled to 16 kHz mono. WAV files are accepted.
 
-## Test Results
+### 4. Run the benchmark
 
-Tested on Apple M-series with Metal acceleration.
+```bash
+cargo run --bin benchmark --release -- --model-dir models --runs 3
+cargo run --bin benchmark --release -- --model-dir models_1.7b --runs 3
+```
 
-| Sample | Duration | Model | Result |
-|--------|----------|-------|--------|
-| English sentence | 3 s | 0.6B | ✓ exact match |
-| English sentence | 3 s | 1.7B | ✓ exact match |
-| Long English paragraph | 45 s | 0.6B | ✓ exact match |
-| Long English paragraph | 45 s | 1.7B | ✓ exact match |
-| Long Chinese paragraph | 30 s | 0.6B | ✓ exact match |
-| Long Chinese paragraph | 30 s | 1.7B | ✓ near-exact match |
-| Mixed Chinese-English | 25 s | 0.6B | ✓ full transcription |
-| Mixed Chinese-English | 25 s | 1.7B | ✓ full transcription |
+## Benchmark
+
+### Test Environment
+
+| Item | Value |
+|------|-------|
+| Hardware | Apple Mac mini, M4 (4P+6E cores), 16 GB unified memory |
+| OS | macOS 26.3 (Darwin 25.3.0) |
+| Rust | 1.93.1 |
+| candle | 0.9.2 |
+| Backend | Metal (Apple GPU) |
+| Condition | Warm file-system cache; single-threaded inference; mean of 3 runs per sample |
+
+### Audio Samples
+
+| Sample | Language | Duration |
+|--------|----------|----------|
+| sample1.wav | English | 3.4 s |
+| sample2.wav | English | 4.0 s |
+| sample4.wav | English (long) | 36.4 s |
+| sample5.wav | Mandarin (long) | 30.4 s |
+| sample6.wav | Code-switched (long) | 28.7 s |
+
+### Model Load Time and Memory
+
+| Model | File Size | Load Time | Peak RSS | Phys Footprint |
+|-------|-----------|-----------|----------|----------------|
+| Qwen3-ASR-0.6B | 1.7 GB | 489 ms | 3707 MiB | 1883 MiB |
+| Qwen3-ASR-1.7B | 4.5 GB | 4250 ms | 3493 MiB | 4569 MiB |
+
+Two memory metrics are reported:
+
+- **Peak RSS** — `getrusage(RUSAGE_SELF)` high-water mark over the whole process lifetime; never decreases; inflated by transient allocations during safetensors loading
+- **Phys footprint** — `task_info TASK_VM_INFO phys_footprint` current physical pages owned by the process (including Metal GPU buffers); reflects actual live model memory after loading
+
+### Real-Time Factor (RTF)
+
+**RTF = inference\_time / audio\_duration.** Values below 1.0 mean faster-than-real-time. Lower is better.
+
+| Model | sample1 | sample2 | sample4 | sample5 | sample6 | **Avg RTF** |
+|-------|---------|---------|---------|---------|---------|-------------|
+| 0.6B BF16 | 0.149 | 0.136 | 0.254 | 0.237 | 0.216 | **0.230** |
+| 1.7B BF16 | 0.307 | 0.253 | 0.338 | 0.324 | 0.302 | **0.319** |
+
+Both models run well below real-time on Apple M4 Metal. Short samples show higher variance because Metal shader warm-up cost is amortised over fewer tokens.
 
 ## Dependencies
 
@@ -155,18 +219,17 @@ Tested on Apple M-series with Metal acceleration.
 
 ## Enabling CUDA
 
-```toml
-# Cargo.toml
-[features]
-default = ["cuda"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+Pass `--features cuda` (and disable the default Metal feature) when building on Linux/Windows with an NVIDIA GPU:
+
+```bash
+cargo run --release --no-default-features --features cuda
 ```
 
 ## Implementation Notes
 
 - **Mel extraction** matches `WhisperFeatureExtractor` exactly: Slaney-normalized filterbanks, `n_fft=400`, `hop_length=160`, `n_mels=128`, max diff < 3e-5 vs PyTorch reference
 - **Positional embeddings** in the audio encoder are sinusoidal and computed per-chunk (positions reset to 0 for each 30-second window), matching the Python reference
-- **BF16 precision** is used throughout — LayerNorm and softmax are computed in F32 and cast back — this matches the official PyTorch BF16 output
+- **BF16 precision** throughout — `candle_nn::LayerNorm` and `candle_nn::RmsNorm` handle the F32 upcast internally; attention softmax uses `softmax_last_dim` (subtract-max stable, native Metal kernel), matching Qwen2 / candle-transformers convention
 - **Token 151704** (`<asr_sep>`) splits the decoder output into `language` and `text` fields; it is absent from the base Qwen3 tokenizer (decodes to `""`) so it is detected by token ID directly
 
 ## License

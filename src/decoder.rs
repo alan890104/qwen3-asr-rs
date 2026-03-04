@@ -1,82 +1,32 @@
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
-use candle_nn::ops::softmax;
+use candle_core::{Device, Tensor};
+use candle_nn::{Module, RmsNorm};
+use candle_nn::ops::softmax_last_dim;
 use std::collections::HashMap;
 
 use crate::config::TextDecoderConfig;
+use crate::linear::LinearW;
 
-fn get_weight(weights: &HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
+// ─── Weight helpers (dense / safetensors path) ────────────────────────────────
+
+fn get_w(weights: &HashMap<String, Tensor>, name: &str) -> anyhow::Result<Tensor> {
     weights
         .get(name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("weight not found: {}", name))
 }
 
-// ─── RMS Norm ────────────────────────────────────────────────────────────────
-
-struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
+fn load_linear(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<LinearW> {
+    Ok(LinearW::new(get_w(weights, &format!("{}.weight", prefix))?, None))
 }
 
-impl RmsNorm {
-    fn load(weights: &HashMap<String, Tensor>, prefix: &str, eps: f64) -> Result<Self> {
-        Ok(Self {
-            weight: get_weight(weights, &format!("{}.weight", prefix))?,
-            eps,
-        })
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let last_dim = x_f32.rank() - 1;
-        let norm_sq = x_f32.sqr()?.mean_keepdim(last_dim)?;
-        let inv_rms = (norm_sq + self.eps)?.sqrt()?.recip()?;
-        let x_normed = x_f32.broadcast_mul(&inv_rms)?;
-        x_normed
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
-            .to_dtype(dtype)
-            .map_err(Into::into)
-    }
-}
-
-// ─── Linear ──────────────────────────────────────────────────────────────────
-
-struct Linear {
-    weight: Tensor,
-}
-
-impl Linear {
-    fn from_weight(weight: Tensor) -> Self {
-        Self { weight }
-    }
-
-    fn load(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            weight: get_weight(weights, &format!("{}.weight", prefix))?,
-        })
-    }
-
-    // Use the weight's native dtype (BF16) for matmul to match the reference.
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = self.weight.dtype();
-        let x_cast = x.to_dtype(dtype)?;
-        let out_features = self.weight.dims()[0];
-        let dims = x_cast.dims().to_vec();
-        let in_features = dims[dims.len() - 1];
-        let batch: usize = dims[..dims.len() - 1].iter().product();
-        let x_2d = x_cast.reshape((batch, in_features))?;
-        let out_2d = x_2d.matmul(&self.weight.t()?)?;
-        let mut out_shape = dims[..dims.len() - 1].to_vec();
-        out_shape.push(out_features);
-        Ok(out_2d.reshape(out_shape)?)
-    }
+fn load_rms_norm(weights: &HashMap<String, Tensor>, prefix: &str, eps: f64) -> Result<RmsNorm> {
+    Ok(RmsNorm::new(get_w(weights, &format!("{}.weight", prefix))?, eps))
 }
 
 // ─── MRoPE ───────────────────────────────────────────────────────────────────
 
-pub fn compute_mrope_cos_sin(
+pub(crate) fn compute_mrope_cos_sin(
     position_ids: &[Vec<i64>; 3],
     head_dim: usize,
     rope_theta: f64,
@@ -178,7 +128,7 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 
 fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
-        return Ok(x); // consume ownership: no clone needed
+        return Ok(x);
     }
     let (bsz, num_kv, seq, hd) = x.dims4()?;
     x.unsqueeze(2)?
@@ -189,24 +139,24 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 
 // ─── KV Cache ─────────────────────────────────────────────────────────────────
 
-pub struct KvCache {
-    pub layers: Vec<Option<(Tensor, Tensor)>>,
+pub(crate) struct KvCache {
+    layers: Vec<Option<(Tensor, Tensor)>>,
 }
 
 impl KvCache {
-    pub fn new(num_layers: usize) -> Self {
+    pub(crate) fn new(num_layers: usize) -> Self {
         Self { layers: vec![None; num_layers] }
     }
 
-    pub fn get(&self, layer: usize) -> Option<&(Tensor, Tensor)> {
+    pub(crate) fn get(&self, layer: usize) -> Option<&(Tensor, Tensor)> {
         self.layers[layer].as_ref()
     }
 
-    pub fn set(&mut self, layer: usize, cache: (Tensor, Tensor)) {
+    pub(crate) fn set(&mut self, layer: usize, cache: (Tensor, Tensor)) {
         self.layers[layer] = Some(cache);
     }
 
-    pub fn seq_len(&self) -> usize {
+    pub(crate) fn seq_len(&self) -> usize {
         self.layers[0]
             .as_ref()
             .map(|(k, _)| k.dims()[2])
@@ -217,10 +167,10 @@ impl KvCache {
 // ─── Text Attention (GQA + QK-norm + MRoPE) ───────────────────────────────────
 
 struct TextAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: LinearW,
+    k_proj: LinearW,
+    v_proj: LinearW,
+    o_proj: LinearW,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_q_heads: usize,
@@ -238,12 +188,12 @@ impl TextAttention {
         rms_norm_eps: f64,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: Linear::load(weights, &format!("{}.q_proj", prefix))?,
-            k_proj: Linear::load(weights, &format!("{}.k_proj", prefix))?,
-            v_proj: Linear::load(weights, &format!("{}.v_proj", prefix))?,
-            o_proj: Linear::load(weights, &format!("{}.o_proj", prefix))?,
-            q_norm: RmsNorm::load(weights, &format!("{}.q_norm", prefix), rms_norm_eps)?,
-            k_norm: RmsNorm::load(weights, &format!("{}.k_norm", prefix), rms_norm_eps)?,
+            q_proj: load_linear(weights, &format!("{}.q_proj", prefix))?,
+            k_proj: load_linear(weights, &format!("{}.k_proj", prefix))?,
+            v_proj: load_linear(weights, &format!("{}.v_proj", prefix))?,
+            o_proj: load_linear(weights, &format!("{}.o_proj", prefix))?,
+            q_norm: load_rms_norm(weights, &format!("{}.q_norm", prefix), rms_norm_eps)?,
+            k_norm: load_rms_norm(weights, &format!("{}.k_norm", prefix), rms_norm_eps)?,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -284,8 +234,6 @@ impl TextAttention {
             (k, v)
         };
 
-        // Save pre-expand K/V as the cache entry, then consume originals for repeat_kv.
-        // This avoids a second clone inside repeat_kv when n_rep == 1.
         let n_rep = nqh / nkvh;
         let new_cache = (k.clone(), v.clone());
         let k = repeat_kv(k, n_rep)?;
@@ -300,9 +248,7 @@ impl TextAttention {
             attn = attn.broadcast_add(&m.to_dtype(attn.dtype())?)?;
         }
 
-        // Softmax in F32 for numerical stability, cast back to compute dtype.
-        let attn_dtype = attn.dtype();
-        let attn = softmax(&attn.to_dtype(DType::F32)?, 3)?.to_dtype(attn_dtype)?;
+        let attn = softmax_last_dim(&attn)?;
         let out = attn.matmul(&v)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((bsz, seq_len, nqh * hd))?;
         let out = self.o_proj.forward(&out)?;
@@ -314,24 +260,24 @@ impl TextAttention {
 // ─── SwiGLU MLP ───────────────────────────────────────────────────────────────
 
 struct TextMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: LinearW,
+    up_proj: LinearW,
+    down_proj: LinearW,
 }
 
 impl TextMlp {
     fn load(weights: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
         Ok(Self {
-            gate_proj: Linear::load(weights, &format!("{}.gate_proj", prefix))?,
-            up_proj: Linear::load(weights, &format!("{}.up_proj", prefix))?,
-            down_proj: Linear::load(weights, &format!("{}.down_proj", prefix))?,
+            gate_proj: load_linear(weights, &format!("{}.gate_proj", prefix))?,
+            up_proj:   load_linear(weights, &format!("{}.up_proj", prefix))?,
+            down_proj: load_linear(weights, &format!("{}.down_proj", prefix))?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?.silu()?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        self.down_proj.forward(&(gate * up)?).map_err(Into::into)
     }
 }
 
@@ -354,7 +300,7 @@ impl TextDecoderLayer {
         rms_norm_eps: f64,
     ) -> Result<Self> {
         Ok(Self {
-            input_layernorm: RmsNorm::load(
+            input_layernorm: load_rms_norm(
                 weights,
                 &format!("{}.input_layernorm", prefix),
                 rms_norm_eps,
@@ -367,7 +313,7 @@ impl TextDecoderLayer {
                 head_dim,
                 rms_norm_eps,
             )?,
-            post_attention_layernorm: RmsNorm::load(
+            post_attention_layernorm: load_rms_norm(
                 weights,
                 &format!("{}.post_attention_layernorm", prefix),
                 rms_norm_eps,
@@ -400,9 +346,8 @@ impl TextDecoderLayer {
 
 // ─── Causal mask ─────────────────────────────────────────────────────────────
 
-pub fn create_causal_mask(seq_len: usize, past_len: usize, device: &Device) -> Result<Tensor> {
+pub(crate) fn create_causal_mask(seq_len: usize, past_len: usize, device: &Device) -> Result<Tensor> {
     let total_len = past_len + seq_len;
-    // Create upper triangular mask: positions j > past_len + i get -inf
     let mut mask_data = vec![0.0f32; seq_len * total_len];
     for i in 0..seq_len {
         for j in 0..total_len {
@@ -416,22 +361,21 @@ pub fn create_causal_mask(seq_len: usize, past_len: usize, device: &Device) -> R
 
 // ─── Text Decoder ────────────────────────────────────────────────────────────
 
-pub struct TextDecoder {
+pub(crate) struct TextDecoder {
     embed_tokens: Tensor,
     layers: Vec<TextDecoderLayer>,
     norm: RmsNorm,
-    lm_head_weight: Tensor,
-    config: TextDecoderConfig,
+    lm_head: LinearW,
 }
 
 impl TextDecoder {
-    pub fn load(
+    pub(crate) fn load(
         weights: &HashMap<String, Tensor>,
         prefix: &str,
         config: &TextDecoderConfig,
     ) -> Result<Self> {
         let embed_tokens =
-            get_weight(weights, &format!("{}.embed_tokens.weight", prefix))?;
+            get_w(weights, &format!("{}.embed_tokens.weight", prefix))?;
 
         let mut layers = Vec::new();
         for i in 0..config.num_hidden_layers {
@@ -446,27 +390,21 @@ impl TextDecoder {
             layers.push(layer);
         }
 
-        let norm = RmsNorm::load(weights, &format!("{}.norm", prefix), config.rms_norm_eps)?;
+        let norm = load_rms_norm(weights, &format!("{}.norm", prefix), config.rms_norm_eps)?;
+        // Tie lm_head weights to embed_tokens (weight tying).
+        let lm_head = LinearW::new(embed_tokens.clone(), None);
 
-        // LM head: tied to embed_tokens if tie_word_embeddings = true
-        let lm_head_weight = if config.tie_word_embeddings {
-            embed_tokens.clone()
-        } else {
-            let lm_head_prefix = prefix.replace(".model", ".lm_head");
-            get_weight(weights, &format!("{}.weight", lm_head_prefix))?
-        };
-
-        Ok(Self { embed_tokens, layers, norm, lm_head_weight, config: config.clone() })
+        Ok(Self { embed_tokens, layers, norm, lm_head })
     }
 
     /// Look up token embeddings. Returns the native dtype of the embedding table (BF16).
-    pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub(crate) fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens
             .index_select(input_ids, 0)
             .map_err(Into::into)
     }
 
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor, // [1, seq, hidden]
         cos: &Tensor,           // [seq, head_dim], F32
@@ -476,8 +414,7 @@ impl TextDecoder {
     ) -> Result<Tensor> {
         let mut hidden = hidden_states.clone();
 
-        // Cast cos/sin to compute dtype and unsqueeze to [1, 1, seq, head_dim] once,
-        // rather than repeating the cast inside apply_rotary_emb for every layer.
+        // Cast cos/sin to compute dtype and unsqueeze to [1, 1, seq, head_dim] once.
         let compute_dtype = hidden.dtype();
         let cos4d = cos.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
         let sin4d = sin.to_dtype(compute_dtype)?.unsqueeze(0)?.unsqueeze(0)?;
@@ -489,22 +426,132 @@ impl TextDecoder {
             hidden = h;
         }
 
-        let hidden = self.norm.forward(&hidden)?;
-        let lm_w = &self.lm_head_weight;
-        // Reshape to 2D for matmul (candle requires same-rank tensors).
-        // Cast hidden to weight dtype (BF16) for matmul.
-        let dims = hidden.dims().to_vec();
-        let hidden_size = dims[dims.len() - 1];
-        let batch: usize = dims[..dims.len() - 1].iter().product();
-        let hidden_2d = hidden.to_dtype(lm_w.dtype())?.reshape((batch, hidden_size))?;
-        let logits_2d = hidden_2d.matmul(&lm_w.t()?)?;
-        let vocab_size = lm_w.dims()[0];
-        let mut out_shape = dims[..dims.len() - 1].to_vec();
-        out_shape.push(vocab_size);
-        logits_2d.reshape(out_shape).map_err(Into::into)
+        // LN → lm_head (weight-tied to embed_tokens).
+        // LinearW::Dense: candle_nn::Linear::forward has 3D fast path.
+        // LinearW::Quant: QMatMul::forward uses broadcast_matmul (also 3D-safe).
+        self.lm_head.forward(&self.norm.forward(&hidden)?).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn test_causal_mask_prefill() {
+        let device = Device::Cpu;
+        let mask = create_causal_mask(3, 0, &device).unwrap();
+        assert_eq!(mask.dims(), &[1, 1, 3, 3]);
+        let data: Vec<f32> = mask
+            .squeeze(0).unwrap()
+            .squeeze(0).unwrap()
+            .flatten_all().unwrap()
+            .to_vec1().unwrap();
+        // Row 0: [0, -inf, -inf]
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], f32::NEG_INFINITY);
+        assert_eq!(data[2], f32::NEG_INFINITY);
+        // Row 1: [0, 0, -inf]
+        assert_eq!(data[3], 0.0);
+        assert_eq!(data[4], 0.0);
+        assert_eq!(data[5], f32::NEG_INFINITY);
+        // Row 2: [0, 0, 0]
+        assert_eq!(data[6], 0.0);
+        assert_eq!(data[7], 0.0);
+        assert_eq!(data[8], 0.0);
     }
 
-    pub fn config(&self) -> &TextDecoderConfig {
-        &self.config
+    #[test]
+    fn test_causal_mask_decode_step() {
+        let device = Device::Cpu;
+        // seq=1, past=5 → total_len=6; j > 5+0 never triggers → all zeros
+        let mask = create_causal_mask(1, 5, &device).unwrap();
+        assert_eq!(mask.dims(), &[1, 1, 1, 6]);
+        let data: Vec<f32> = mask.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(data.iter().all(|&v| v == 0.0), "decode-step mask should be all zeros");
+    }
+
+    #[test]
+    fn test_build_contiguous_dim_map() {
+        let sections = [2usize, 3, 3];
+        let map = build_contiguous_dim_map(&sections, 8);
+        assert_eq!(map, vec![0, 0, 1, 1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn test_build_interleaved_dim_map() {
+        let sections = [2usize, 2, 2];
+        let map = build_interleaved_dim_map(&sections, 6);
+        assert_eq!(map, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn test_compute_mrope_cos_sin_zero_positions() {
+        let device = Device::Cpu;
+        let seq_len = 4;
+        let head_dim = 8;
+        let mrope_section = [2usize, 3, 3];
+        // All positions = 0 → angle = 0 → cos = 1, sin = 0 everywhere
+        let position_ids: [Vec<i64>; 3] = [
+            vec![0i64; seq_len],
+            vec![0i64; seq_len],
+            vec![0i64; seq_len],
+        ];
+        let (cos, sin) = compute_mrope_cos_sin(
+            &position_ids,
+            head_dim,
+            10000.0,
+            &mrope_section,
+            false,
+            &device,
+        )
+        .unwrap();
+        assert_eq!(cos.dims(), &[seq_len, head_dim]);
+        assert_eq!(sin.dims(), &[seq_len, head_dim]);
+        let cos_data: Vec<f32> = cos.flatten_all().unwrap().to_vec1().unwrap();
+        let sin_data: Vec<f32> = sin.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (&c, &s)) in cos_data.iter().zip(sin_data.iter()).enumerate() {
+            assert!((c - 1.0).abs() < 1e-6, "cos[{}] should be 1.0, got {}", i, c);
+            assert!(s.abs() < 1e-6, "sin[{}] should be 0.0, got {}", i, s);
+        }
+    }
+
+    #[test]
+    fn test_compute_mrope_cos_sin_pythagorean() {
+        // cos²+sin² must equal 1 at every (t, j)
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let mrope_section = [2usize, 2, 2];
+        let position_ids: [Vec<i64>; 3] = [
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+        ];
+        let (cos, sin) = compute_mrope_cos_sin(
+            &position_ids,
+            head_dim,
+            10000.0,
+            &mrope_section,
+            false,
+            &device,
+        )
+        .unwrap();
+        let cos_data: Vec<f32> = cos.flatten_all().unwrap().to_vec1().unwrap();
+        let sin_data: Vec<f32> = sin.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, (&c, &s)) in cos_data.iter().zip(sin_data.iter()).enumerate() {
+            let r = c * c + s * s;
+            assert!((r - 1.0).abs() < 1e-5, "cos²+sin² at [{}] = {}, want 1", i, r);
+        }
+    }
+
+    #[test]
+    fn test_rotate_half() {
+        let device = Device::Cpu;
+        // x = [[1, 2, 3, 4]] → rotate_half → [[-3, -4, 1, 2]]
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 4), &device).unwrap();
+        let rotated = rotate_half(&x).unwrap();
+        let data: Vec<f32> = rotated.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(data, vec![-3.0f32, -4.0, 1.0, 2.0]);
     }
 }
