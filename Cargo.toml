@@ -1,6 +1,6 @@
 [package]
 name = "qwen3-asr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Rust inference engine for Qwen3-ASR speech recognition models using candle"
 license = "MIT"
