@@ -162,6 +162,73 @@ fn test_streaming_vs_batch_consistency() {
     assert!(stream_result.raw_output.len() <= 10000, "stream raw_output should be bounded");
 }
 
+/// Test that `initial_text` is used as prefix during cold-start chunks.
+///
+/// Runs two streaming sessions on a longer audio — one without initial_text
+/// and one with context from a "previous session". Both must succeed and
+/// produce non-empty text, confirming the initial_text code path works.
+#[test]
+#[ignore]
+fn test_streaming_initial_text_cross_session() {
+    let engine = load_engine();
+
+    // Use sample4.wav (English paragraph, 36s) for a robust test.
+    // Fall back to sample1.wav or tone if not available.
+    let wav_path = if Path::new("audio/sample4.wav").exists() {
+        Path::new("audio/sample4.wav")
+    } else if Path::new("audio/sample1.wav").exists() {
+        Path::new("audio/sample1.wav")
+    } else {
+        eprintln!("No test audio found, using tone");
+        // Return early with tone test
+        let samples = sine_tone(440.0, 6.0, 16000);
+        let opts = qwen3_asr::StreamingOptions::default()
+            .with_initial_text("Some prior context text.");
+        let mut state = engine.init_streaming(opts);
+        let chunk_samples = 32000;
+        for chunk_start in (0..samples.len()).step_by(chunk_samples) {
+            let chunk_end = (chunk_start + chunk_samples).min(samples.len());
+            let _ = engine.feed_audio(&mut state, &samples[chunk_start..chunk_end]);
+        }
+        let result = engine.finish_streaming(&mut state).unwrap();
+        eprintln!("Tone with initial_text: {:?}", result.text);
+        return;
+    };
+
+    let samples = load_wav_16k(wav_path);
+    let chunk_samples = 32000;
+    eprintln!("Test audio: {:.1}s from {}", samples.len() as f32 / 16000.0, wav_path.display());
+
+    // Session 1: no initial_text (baseline)
+    let opts1 = qwen3_asr::StreamingOptions::default()
+        .with_chunk_size_sec(2.0);
+    let mut state1 = engine.init_streaming(opts1);
+    for chunk_start in (0..samples.len()).step_by(chunk_samples) {
+        let chunk_end = (chunk_start + chunk_samples).min(samples.len());
+        let _ = engine.feed_audio(&mut state1, &samples[chunk_start..chunk_end]);
+    }
+    let result1 = engine.finish_streaming(&mut state1).unwrap();
+    eprintln!("Without initial_text: {:?}", result1.text);
+
+    // Session 2: with initial_text simulating cross-session context.
+    // Use the first sentence of the expected transcript as "previous context".
+    let context = "Artificial intelligence has rapidly transformed numerous industries.";
+    let opts2 = qwen3_asr::StreamingOptions::default()
+        .with_chunk_size_sec(2.0)
+        .with_initial_text(context);
+    let mut state2 = engine.init_streaming(opts2);
+    for chunk_start in (0..samples.len()).step_by(chunk_samples) {
+        let chunk_end = (chunk_start + chunk_samples).min(samples.len());
+        let _ = engine.feed_audio(&mut state2, &samples[chunk_start..chunk_end]);
+    }
+    let result2 = engine.finish_streaming(&mut state2).unwrap();
+    eprintln!("With initial_text:    {:?}", result2.text);
+
+    // Both sessions must succeed and produce non-empty text for real speech.
+    assert!(!result1.text.is_empty(), "session 1 (no context) should produce text");
+    assert!(!result2.text.is_empty(), "session 2 (with context) should produce text");
+}
+
 /// Test with a real WAV file if available.
 /// Set QWEN3_ASR_TEST_WAV to a path to run this test.
 #[test]

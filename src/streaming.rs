@@ -21,6 +21,11 @@ pub struct StreamingOptions {
     pub max_new_tokens_streaming: usize,
     /// Maximum new tokens for the final flush. Default: 512.
     pub max_new_tokens_final: usize,
+    /// Optional context text from a previous session (e.g. last ~200 chars of prior
+    /// transcript). Used as the prefix during cold-start chunks to guide vocabulary
+    /// and style consistency across session resets. After cold start, the normal
+    /// rollback mechanism takes over with real transcription tokens.
+    pub initial_text: Option<String>,
 }
 
 impl Default for StreamingOptions {
@@ -32,6 +37,7 @@ impl Default for StreamingOptions {
             unfixed_token_num: 5,
             max_new_tokens_streaming: 32,
             max_new_tokens_final: 512,
+            initial_text: None,
         }
     }
 }
@@ -70,6 +76,18 @@ impl StreamingOptions {
     /// Force a specific language.
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
         self.language = Some(language.into());
+        self
+    }
+
+    /// Provide context text from a previous session for cross-session continuity.
+    ///
+    /// During cold-start chunks (before real rollback tokens are available),
+    /// this text is used as the decoder prefix, guiding the model's vocabulary
+    /// and style to be consistent with the prior transcript. After cold start,
+    /// the normal rollback mechanism takes over automatically.
+    pub fn with_initial_text(mut self, text: impl Into<String>) -> Self {
+        let t = text.into();
+        self.initial_text = if t.is_empty() { None } else { Some(t) };
         self
     }
 }
@@ -258,10 +276,16 @@ pub(crate) fn compute_prefix_ids(state: &StreamingState) -> Option<&[u32]> {
 
 /// Build the prefix text for the current streaming step using the rollback strategy.
 ///
-/// For the first `unfixed_chunk_num` chunks, no prefix is used (cold start).
-/// After that, we take the previous raw token output and drop the last
-/// `unfixed_token_num` tokens, then decode the remaining to text.
+/// For the first `unfixed_chunk_num` chunks (cold start), uses `initial_text`
+/// from options (if set) to provide cross-session context. After cold start,
+/// we take the previous raw token output and drop the last `unfixed_token_num`
+/// tokens, then decode the remaining to text.
 pub(crate) fn build_prefix(inner: &AsrInferenceInner, state: &StreamingState) -> Option<String> {
+    // During cold start, use initial_text for cross-session context if available.
+    if state.chunk_id <= state.options.unfixed_chunk_num {
+        return state.options.initial_text.clone();
+    }
+
     let prefix_ids = compute_prefix_ids(state)?;
     let prefix_text = inner.tokenizer_decode(prefix_ids).ok()?;
 
@@ -335,6 +359,7 @@ mod tests {
             unfixed_token_num,
             max_new_tokens_streaming: 32,
             max_new_tokens_final: 512,
+            initial_text: None,
         };
         let chunk_size_samples = (chunk_size_sec * 16000.0) as usize;
         StreamingState {
@@ -361,6 +386,7 @@ mod tests {
         assert_eq!(opts.max_new_tokens_streaming, 32);
         assert_eq!(opts.max_new_tokens_final, 512);
         assert!(opts.language.is_none());
+        assert!(opts.initial_text.is_none());
     }
 
     // ── chunk_size_samples calculation ───────────────────────────────────
@@ -633,5 +659,59 @@ mod tests {
     fn test_streaming_options_auto_language() {
         let opts = StreamingOptions::default();
         assert!(opts.language.is_none());
+    }
+
+    // ── initial_text ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_streaming_options_default_initial_text_is_none() {
+        let opts = StreamingOptions::default();
+        assert!(opts.initial_text.is_none());
+    }
+
+    #[test]
+    fn test_with_initial_text_sets_value() {
+        let opts = StreamingOptions::default()
+            .with_initial_text("previous transcript context");
+        assert_eq!(opts.initial_text.as_deref(), Some("previous transcript context"));
+    }
+
+    #[test]
+    fn test_with_initial_text_empty_string_becomes_none() {
+        let opts = StreamingOptions::default()
+            .with_initial_text("");
+        assert!(opts.initial_text.is_none());
+    }
+
+    #[test]
+    fn test_with_initial_text_chained_with_other_builders() {
+        let opts = StreamingOptions::default()
+            .with_language("chinese")
+            .with_initial_text("之前的文字")
+            .with_chunk_size_sec(3.0);
+        assert_eq!(opts.language.as_deref(), Some("chinese"));
+        assert_eq!(opts.initial_text.as_deref(), Some("之前的文字"));
+        assert_eq!(opts.chunk_size_sec, 3.0);
+    }
+
+    #[test]
+    fn test_compute_prefix_ids_cold_start_returns_none_regardless_of_initial_text() {
+        // compute_prefix_ids is pure token logic — it always returns None during cold start.
+        // The build_prefix function is responsible for returning initial_text instead.
+        let mut state = make_state(2.0, 2, 5);
+        state.options.initial_text = Some("context".to_string());
+        state.chunk_id = 1;
+        state.raw_token_ids = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(compute_prefix_ids(&state), None);
+    }
+
+    #[test]
+    fn test_compute_prefix_ids_after_cold_start_ignores_initial_text() {
+        // After cold start, normal rollback is used regardless of initial_text.
+        let mut state = make_state(2.0, 2, 5);
+        state.options.initial_text = Some("context".to_string());
+        state.chunk_id = 3;
+        state.raw_token_ids = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(compute_prefix_ids(&state), Some(&[1, 2, 3, 4, 5][..]));
     }
 }

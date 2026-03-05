@@ -252,17 +252,27 @@ The [Qwen3-ASR technical report](https://arxiv.org/abs/2601.21337) states the mo
 
 **Short sessions (< 20 min)** — use the streaming API directly.
 
-**Long-running streams (meetings, lectures)** — reset sessions at silence boundaries. Starting a new session is instant (zero-cost struct init, no model reload):
+**Long-running streams (meetings, lectures)** — reset sessions at silence boundaries. Pass `initial_text` from the previous session for cross-session context continuity. Starting a new session is instant (zero-cost struct init, no model reload):
 
 ```rust
-let mut state = engine.init_streaming(opts.clone());
+let make_opts = |ctx: Option<String>| {
+    let mut opts = StreamingOptions::default();
+    if let Some(text) = ctx {
+        opts = opts.with_initial_text(text);
+    }
+    opts
+};
+let mut state = engine.init_streaming(make_opts(None));
 
 loop {
     let chunk = read_mic();
     if vad_detects_silence(&chunk, threshold) {
         let result = engine.finish_streaming(&mut state)?;
         save_transcript(&result);
-        state = engine.init_streaming(opts.clone()); // instant, zero cost
+        // Pass last ~200 chars as context for the next session
+        let ctx = result.text.chars().rev().take(200).collect::<String>()
+            .chars().rev().collect::<String>();
+        state = engine.init_streaming(make_opts(Some(ctx)));
     } else {
         if let Some(result) = engine.feed_audio(&mut state, &chunk)? {
             display_subtitle(&result.text);
@@ -271,7 +281,7 @@ loop {
 }
 ```
 
-Each session stays short (one utterance), so memory and latency remain constant. This pattern runs indefinitely.
+Each session stays short (one utterance), so memory and latency remain constant. `initial_text` provides vocabulary/style continuity across resets. This pattern runs indefinitely.
 
 **Long pre-recorded files (podcasts, recordings)** — do not use streaming. Split audio into segments and batch-transcribe each:
 
