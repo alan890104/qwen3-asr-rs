@@ -5,11 +5,11 @@ use std::path::PathBuf;
 
 fn main() -> Result<()> {
     // CLI argument parsing: optional positional argument for model directory.
-    // Usage: cargo run --release -- [model_dir]
+    // Usage: cargo run --example demo --release -- [model_dir]
     let args: Vec<String> = std::env::args().collect();
     let model_dir_arg: Option<String> = args.get(1).filter(|s| !s.starts_with('-')).cloned();
 
-    let audio_dir = PathBuf::from("audio");
+    let audio_dir = PathBuf::from("tests/fixtures/audio");
 
     let device = qwen3_asr::best_device();
     eprintln!("Device: {:?}", device);

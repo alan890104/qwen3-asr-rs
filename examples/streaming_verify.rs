@@ -4,7 +4,7 @@
 //!   cargo run --release --example streaming_verify -- <wav_file> [chunk_size_sec]
 //!
 //! Example:
-//!   cargo run --release --example streaming_verify -- audio/sample4.wav 2.0
+//!   cargo run --release --example streaming_verify -- tests/fixtures/audio/sample4.wav 2.0
 
 use std::path::PathBuf;
 use std::time::Instant;

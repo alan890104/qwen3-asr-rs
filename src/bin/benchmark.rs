@@ -36,7 +36,7 @@ fn parse_args() -> Cli {
     let mut model_id: Option<String> = None;
     #[cfg(feature = "hub")]
     let mut cache_dir = PathBuf::from("models");
-    let mut audio_dir = PathBuf::from("audio");
+    let mut audio_dir = PathBuf::from("tests/fixtures/audio");
     let mut runs: usize = 1;
     let mut label = String::new();
 

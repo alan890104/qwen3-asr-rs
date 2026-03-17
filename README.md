@@ -101,17 +101,17 @@ let engine = AsrInference::from_pretrained(
 )?;
 ```
 
-### Build and run the CLI
+### Build and run the demo
 
 ```bash
 # Apple Silicon (Metal)
-cargo run --release
+cargo run --example demo --release
 
 # NVIDIA GPU (CUDA)
-cargo run --release --no-default-features --features cuda
+cargo run --example demo --release --no-default-features --features cuda
 
 # CPU only
-cargo run --release --no-default-features
+cargo run --example demo --release --no-default-features
 ```
 
 ## Benchmark
@@ -143,7 +143,7 @@ Five audio samples covering English, Mandarin, and code-switched speech.
 <details>
 <summary>sample1.wav — English, 3s (click to expand)</summary>
 
-[▶ audio/sample1.wav](audio/sample1.wav)
+[▶ tests/fixtures/audio/sample1.wav](tests/fixtures/audio/sample1.wav)
 
 | | Text |
 |---|---|
@@ -155,7 +155,7 @@ Five audio samples covering English, Mandarin, and code-switched speech.
 <details>
 <summary>sample2.wav — English, 4s</summary>
 
-[▶ audio/sample2.wav](audio/sample2.wav)
+[▶ tests/fixtures/audio/sample2.wav](tests/fixtures/audio/sample2.wav)
 
 | | Text |
 |---|---|
@@ -167,7 +167,7 @@ Five audio samples covering English, Mandarin, and code-switched speech.
 <details>
 <summary>sample4.wav — English paragraph, 36s</summary>
 
-[▶ audio/sample4.wav](audio/sample4.wav)
+[▶ tests/fixtures/audio/sample4.wav](tests/fixtures/audio/sample4.wav)
 
 **Expected:**
 > Artificial intelligence has rapidly transformed numerous industries over the past decade. From healthcare diagnostics to autonomous vehicles, machine learning models are now capable of performing tasks that once required years of human expertise. Natural language processing, in particular, has seen dramatic improvements, enabling computers to understand, generate, and translate human speech with remarkable accuracy. Researchers continue to push the boundaries of what is possible, developing systems that can reason, plan, and even demonstrate creativity.
@@ -179,7 +179,7 @@ Five audio samples covering English, Mandarin, and code-switched speech.
 <details>
 <summary>sample5.wav — Mandarin paragraph, 30s</summary>
 
-[▶ audio/sample5.wav](audio/sample5.wav)
+[▶ tests/fixtures/audio/sample5.wav](tests/fixtures/audio/sample5.wav)
 
 **Expected:**
 > 随着科技的不断进步，人工智能已经深入到我们日常生活的每个角落。在医疗领域，智能诊断系统能够通过分析医学影像，快速准确地识别疾病。在交通领域，自动驾驶技术正在逐步走向成熟。在教育领域，个性化学习系统能够根据每个学生的学习进度，提供量身定制的教学内容，让每个孩子都能得到最适合自己的教育。
@@ -191,7 +191,7 @@ Five audio samples covering English, Mandarin, and code-switched speech.
 <details>
 <summary>sample6.wav — Code-switched Chinese + English, 29s</summary>
 
-[▶ audio/sample6.wav](audio/sample6.wav)
+[▶ tests/fixtures/audio/sample6.wav](tests/fixtures/audio/sample6.wav)
 
 **Expected:**
 > 今天我们来讨论一下大语言模型的发展现状。Large language models like GPT and Claude have shown impressive results on a wide range of benchmarks, demonstrating strong reasoning and language understanding capabilities. 未来，随着多模态技术的进步，这些模型将能够同时处理文字、图像和语音，实现更加自然和智能的人机交互。

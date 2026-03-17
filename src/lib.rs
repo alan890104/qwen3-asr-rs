@@ -2,6 +2,8 @@ mod config;
 mod decoder;
 mod encoder;
 mod error;
+#[cfg(feature = "hub")]
+pub(crate) mod hub;
 mod inference;
 mod linear;
 mod mel;

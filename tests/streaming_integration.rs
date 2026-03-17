@@ -174,10 +174,10 @@ fn test_streaming_initial_text_cross_session() {
 
     // Use sample4.wav (English paragraph, 36s) for a robust test.
     // Fall back to sample1.wav or tone if not available.
-    let wav_path = if Path::new("audio/sample4.wav").exists() {
-        Path::new("audio/sample4.wav")
-    } else if Path::new("audio/sample1.wav").exists() {
-        Path::new("audio/sample1.wav")
+    let wav_path = if Path::new("tests/fixtures/audio/sample4.wav").exists() {
+        Path::new("tests/fixtures/audio/sample4.wav")
+    } else if Path::new("tests/fixtures/audio/sample1.wav").exists() {
+        Path::new("tests/fixtures/audio/sample1.wav")
     } else {
         eprintln!("No test audio found, using tone");
         // Return early with tone test
