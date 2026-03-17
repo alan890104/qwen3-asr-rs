@@ -1,6 +1,6 @@
 [package]
 name = "qwen3-asr"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Local speech-to-text (ASR) in Rust — Qwen3-ASR inference with Metal & CUDA GPU acceleration, batch and streaming transcription"
 license = "MIT"
